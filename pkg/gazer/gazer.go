@@ -27,7 +27,7 @@ type Gazer struct {
 	isClosed    bool
 	invokeCount uint64
 	commands    commands
-	mutexes     map[string]*sync.Mutex
+	mutexes     sync.Map
 }
 
 // New returns a new Gazer.
@@ -47,7 +47,7 @@ func New(patterns []string, maxWatchDirs int) (*Gazer, error) {
 		isClosed:    false,
 		invokeCount: 0,
 		commands:    newCommands(),
-		mutexes:     make(map[string]*sync.Mutex),
+		mutexes:     sync.Map{},
 	}, nil
 }
 
@@ -69,51 +69,62 @@ func (g *Gazer) Run(configs *config.Config, timeout int64, restart bool) error {
 	return err
 }
 
+// repeatRunAndWait continuously monitors file system events.
+// - Executes corresponding commands based on provided configuration
+// - Handles process restarts and timeouts if needed
+// - Gracefully shuts down upon receiving a SIGINT signal
 func (g *Gazer) repeatRunAndWait(commandConfigs *config.Config, timeout int64, restart bool) error {
 	sigInt := sigIntChannel()
 
-	isDisposed := false
+	isTerminated := false
 	for {
 		select {
 		case event := <-g.notify.Events:
-			if isDisposed {
+			if isTerminated {
 				break
 			}
 			logger.Debug("Receive: %s", event.Name)
 
-			commandStringList := g.tryToFindCommand(event.Name, commandConfigs)
-			if commandStringList == nil {
-				continue
-			}
-
-			queueManageKey := strings.Join(commandStringList, "\n")
-
-			ongoingCommand := g.commands.get(queueManageKey)
-
-			if ongoingCommand != nil && restart {
-				kill(ongoingCommand.cmd, "Restart")
-				g.commands.update(queueManageKey, nil)
-			}
-
-			if ongoingCommand != nil && !restart {
-				g.commands.enqueue(queueManageKey, event)
-				continue
-			}
-
-			mutex := g.lock(queueManageKey)
-
-			g.invokeCount++
-
-			go func() {
-				g.invoke(commandStringList, queueManageKey, timeout)
-				mutex.Unlock()
-			}()
+			// This line is expected to not be executed concurrently by multiple threads.
+			g.handleEvent(commandConfigs, timeout, restart, event)
 
 		case <-sigInt:
-			isDisposed = true
+			isTerminated = true
 			return nil
 		}
 	}
+}
+
+// handleEvent processes the received file system event.
+func (g *Gazer) handleEvent(commandConfigs *config.Config, timeout int64, restart bool, event notify.Event) {
+	commandStringList := g.tryToFindCommand(event.Name, commandConfigs)
+	if commandStringList == nil {
+		return
+	}
+
+	queueManageKey := strings.Join(commandStringList, "\n")
+
+	ongoingCommand := g.commands.get(queueManageKey)
+
+	if ongoingCommand != nil && restart {
+		kill(ongoingCommand.cmd, "Restart")
+		g.commands.update(queueManageKey, nil)
+	}
+
+	if ongoingCommand != nil && !restart {
+		g.commands.enqueue(queueManageKey, event)
+		return
+	}
+
+	mutex := g.lock(queueManageKey)
+
+	g.invokeCount++
+
+	go func() {
+		g.invoke(commandStringList, queueManageKey, timeout)
+		logger.Debug("Unlock: %s", queueManageKey)
+		mutex.Unlock()
+	}()
 }
 
 func (g *Gazer) tryToFindCommand(filePath string, commandConfigs *config.Config) []string {
@@ -137,15 +148,18 @@ func (g *Gazer) tryToFindCommand(filePath string, commandConfigs *config.Config)
 }
 
 func (g *Gazer) lock(queueManageKey string) *sync.Mutex {
-	mutex, ok := g.mutexes[queueManageKey]
+	logger.Debug("Lock: %s", queueManageKey)
+	mutex, ok := g.mutexes.Load(queueManageKey)
 	if !ok {
 		mutex = &sync.Mutex{}
-		g.mutexes[queueManageKey] = mutex
+		g.mutexes.Store(queueManageKey, mutex)
 	}
-	mutex.Lock()
-	return mutex
+	m := mutex.(*sync.Mutex)
+	m.Lock()
+	return m
 }
 
+// invoke executes commands, handles timeouts, and processes queued events.
 func (g *Gazer) invoke(commandStringList []string, queueManageKey string, timeout int64) {
 	lastLaunched := time.Now()
 

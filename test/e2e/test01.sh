@@ -8,9 +8,9 @@ filedir=$dir/files
 cd $dir
 rm -f test.*.log
 
-timeout -sKILL 3 ${gaze} -v files/*.* | tee test.log &
+timeout -sKILL 5 ${gaze} -v files/*.* | tee test.log &
 
-sleep 0.2
+sleep 1.0
 echo >> $filedir/hello.rb
 sleep 0.2
 echo >> $filedir/hello.go
