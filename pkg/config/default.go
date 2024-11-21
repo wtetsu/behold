@@ -10,6 +10,8 @@ package config
 func Default() string {
 	return `# Gaze configuration(priority: default < ~/.gaze.yml < ~/.config/gaze/gaze.yml < -f option)
 commands:
+- ext: .lisp
+  cmd: sbcl --script {{file}}
 - ext: .go
   cmd: go run "{{file}}"
 - ext: .py
